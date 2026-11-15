@@ -40,8 +40,14 @@ export interface TickResult {
 
 let lastPriorityAt: number | null = null;
 
-/** `now` lets a check move time forward. `deskId` limits the tick to one desk (checks use it). */
-export async function tick(now: Date = new Date(), opts: { deskId?: string } = {}): Promise<TickResult> {
+/**
+ * `now` lets a check move time forward. `deskId` limits the tick to one desk (checks use it).
+ * `reconcile: false` skips the rules over every open record and the retry of escalated tasks:
+ * they are the slow part, and the Brain runs them every RECONCILE_EVERY_MS, not every tick.
+ */
+export async function tick(
+  now: Date = new Date(), opts: { deskId?: string; reconcile?: boolean } = {},
+): Promise<TickResult> {
   const { events, tasks, users, shelters, roads } = await cols();
   const desk = opts.deskId ? { deskId: opts.deskId } : {};
 
@@ -135,8 +141,9 @@ export async function tick(now: Date = new Date(), opts: { deskId?: string } = {
   }
 
   // The rules over what is on the desk now, and escalated tasks tried again. Both write through the dispatcher.
-  const rec = await reconcile(opts.deskId);
-  const re = await redelegate(opts.deskId, now);
+  const full = opts.reconcile !== false;
+  const rec = full ? await reconcile(opts.deskId) : { created: 0, desks: [] as string[] };
+  const re = full ? await redelegate(opts.deskId, now) : { moved: 0, desks: [] as string[] };
   for (const d of new Set([...touched, ...rec.desks, ...re.desks])) await bumpDeskVersion(d);
 
   return {

@@ -19,6 +19,7 @@
     "keeper:check": "tsx --env-file=.env.local lib/keeper-check.ts",
     "helpdesk:check": "tsx --env-file=.env.local lib/helpdesk-check.ts",
     "sweeper:check": "tsx --env-file=.env.local lib/sweeper-check.ts",
+    "brain:check": "tsx --env-file=.env.local lib/brain-check.ts",
     "reconcile:check": "tsx --env-file=.env.local lib/reconcile-check.ts",
     "health": "tsx --env-file=.env.local lib/health-report.ts",
     "feed:synthetic": "tsx --env-file=.env.local workers/synthetic-feed.ts",

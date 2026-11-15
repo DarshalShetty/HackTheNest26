@@ -1,5 +1,6 @@
-// Owned by Role 1. The Brain: ONE loop. Take the next event, let the memory keeper apply it,
-// let the dispatcher react, and every few seconds run the sweeper (Final system design §10).
+// Owned by Role 1. The Brain: ONE loop. Take the waiting events (people first, then the oldest),
+// let the memory keeper apply each and the dispatcher react, then every few seconds run the
+// sweeper (Final system design §10). Events are drained before each sweep, never one per sweep.
 //
 //   npm run brain
 //
@@ -16,6 +17,12 @@ import * as sweeper from "./sweeper";
 
 const ME = `${hostname()}:${process.pid}`;
 const LEASE_MS = 15_000;
+/** Keep handling events for up to this long before the sweeper gets its turn. */
+export const DRAIN_MS = 4000;
+/** The sweeper runs this long after its last run ENDED, so a slow sweep cannot run back to back. */
+export const SWEEP_EVERY_MS = 5000;
+/** The rules over every open record (reconcile, escalated tasks again) are the sweep's slow part. */
+export const RECONCILE_EVERY_MS = 30_000;
 const log = (...m: unknown[]) => console.log(`[brain ${new Date().toISOString().slice(11, 19)}]`, ...m);
 
 /** Hold or renew the lease. False when another live Brain holds it. */
@@ -75,6 +82,25 @@ export async function processEvent(event: Event): Promise<void> {
   }
 }
 
+/**
+ * Handle events until the queue is empty or `ms` has passed. One event per sweep made every
+ * event wait for a whole sweep (about 9 s on the VM), so a person's tap took that long to show.
+ * `beat` runs between events (lease, heartbeat). Returns how many events were handled.
+ */
+export async function drain(
+  filter: { deskId?: string } = {}, ms = DRAIN_MS, beat: () => Promise<boolean> = async () => true,
+): Promise<number> {
+  const until = Date.now() + ms;
+  let handled = 0;
+  while (Date.now() < until && (await beat())) {
+    const event = await takeNext(filter);
+    if (!event) break;
+    await processEvent(event);
+    handled++;
+  }
+  return handled;
+}
+
 /** One turn without the lease or the timers. Used by npm run keeper:check. */
 export async function runOnce(filter: { deskId?: string } = {}): Promise<boolean> {
   const event = await takeNext(filter);
@@ -90,8 +116,22 @@ async function main() {
 
   log(`starting as ${ME}, handling: ${HANDLED.join(", ")}`);
   let waiting = false;
-  let lastSweep = 0;
+  let lastSweepEnd = 0;
+  let lastReconcile = 0;
   let lastBeat = 0;
+  let lastLease = 0;
+
+  // Between events: keep the lease (a long drain or sweep must not let it run out) and the heartbeat.
+  const beat = async (): Promise<boolean> => {
+    if (stopping) return false;
+    const now = Date.now();
+    if (now - lastLease >= LEASE_MS / 3) {
+      if (!(await acquireLease())) return false;
+      lastLease = now;
+    }
+    if (now - lastBeat >= 1000) { lastBeat = now; await markLoop(); }
+    return true;
+  };
 
   while (!stopping) {
     if (!(await acquireLease())) {
@@ -104,15 +144,18 @@ async function main() {
       await sleep(5000);
       continue;
     }
+    lastLease = Date.now();
     if (waiting) { log("lease acquired, running"); waiting = false; }
 
-    const event = await takeNext();
-    if (event) await processEvent(event);
+    // Events first: everything that is waiting, for up to DRAIN_MS.
+    const handled = await drain({}, DRAIN_MS, beat);
 
-    const now = Date.now();
-    if (now - lastSweep >= 5000) {
-      lastSweep = now;
-      const s = await sweeper.tick();
+    if (!stopping && Date.now() - lastSweepEnd >= SWEEP_EVERY_MS && (await acquireLease())) {
+      lastLease = Date.now();
+      const reconcile = Date.now() - lastReconcile >= RECONCILE_EVERY_MS;
+      const s = await sweeper.tick(new Date(), { reconcile });
+      lastSweepEnd = Date.now();
+      if (reconcile) lastReconcile = lastSweepEnd;
       if (s.requeued || s.failed) log(`sweeper: ${s.requeued} stuck event(s) back to pending, ${s.failed} failed`);
       if (s.timedOut || s.checkins || s.unreachable || s.reprioritized || s.created || s.reassigned) {
         log(`sweeper: ${s.timedOut} no answer, ${s.checkins} check-in(s), ${s.unreachable} unreachable, ${s.reprioritized} priority update(s), ${s.created} task(s) made, ${s.reassigned} task(s) reassigned`);
@@ -121,8 +164,8 @@ async function main() {
         log(`sweeper: ${s.approvalsLate} approval(s) sent again, ${s.offline} task(s) off an offline person, ${s.sheltersAsked} shelter question(s), ${s.roadsAsked} road question(s), ${s.needsExpired} proposed need(s) cancelled`);
       }
     }
-    if (now - lastBeat >= 1000) { lastBeat = now; await markLoop(); }
-    if (!event) await sleep(300);
+    if (Date.now() - lastBeat >= 1000) { lastBeat = Date.now(); await markLoop(); }
+    if (!handled) await sleep(300);
   }
 
   log("stopping");
