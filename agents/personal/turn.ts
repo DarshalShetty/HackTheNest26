@@ -12,18 +12,23 @@ import { quakeLine, recentQuakesNear, type NearbyQuake } from "../research/quake
 import { BudgetError } from "../shared/cost";
 import { modelFor, send } from "../shared/llm";
 import { maskPhones } from "../shared/privacy";
+import { stashPending, takePending, type PendingCall } from "./pending";
 import { systemPrompt } from "./prompts";
-import { runTool, toolsFor } from "./tools";
+import { holdWrites, runTool, toolsFor, type ToolOutcome } from "./tools";
 
 export interface TurnInput {
   userId: string;
   text?: string;
   image?: { mediaType: "image/jpeg" | "image/png" | "image/webp" | "image/gif"; base64: string };
   coords?: [number, number];
+  /** Hold what the agent would file until the person says yes (the /talk screen). Without it, tools file at once. */
+  confirm?: boolean;
 }
 export interface TurnResult {
   reply: string;
   eventIds: string[];
+  // Set when confirm held writes: `id` goes back to POST /api/chat { approve }, `items` is what would be sent.
+  pending?: { id: string; items: string[] };
   // For the screen: what the agent filed, and the charts it asked for (type "show_metric", id).
   actions: { tool: string; summary: string; ok: boolean; type?: "show_metric" | "show_map"; id?: string;
     kinds?: string[]; ids?: string[]; text?: string }[];
@@ -43,6 +48,8 @@ export async function runTurn(input: TurnInput): Promise<TurnResult> {
   if (!said && !input.image) return { reply: "Say or send something and I will take it from there.", eventIds: [], actions: [] };
 
   const { model, effort } = modelFor("chat");
+  if (input.confirm) holdWrites(ctx);
+  const held: (PendingCall & { summary: string })[] = [];
   let tools = toolsFor(ctx);
   const system: Anthropic.Beta.BetaTextBlockParam[] = [
     // Stable per role and shared by everyone in that role (tools + system are the prefix).
@@ -102,8 +109,9 @@ export async function runTurn(input: TurnInput): Promise<TurnResult> {
         }
         toolCalls++;
         const out = await runTool(c.name, (c.input ?? {}) as Record<string, unknown>, ctx)
-          .catch((e: Error) => ({ content: `Tool failed: ${e.message}`, isError: true, eventId: undefined, summary: undefined }));
+          .catch((e: Error): ToolOutcome => ({ content: `Tool failed: ${e.message}`, isError: true }));
         if (out.eventId) eventIds.push(out.eventId);
+        if (out.pending) held.push({ name: c.name, input: (c.input ?? {}) as Record<string, unknown>, summary: out.summary ?? c.name });
         if (c.name !== "ask_desk") actions.push({ tool: c.name, summary: out.summary ?? out.content.slice(0, 120), ok: !out.isError,
           ...("showMetric" in out && out.showMetric ? { type: "show_metric" as const, id: out.showMetric } : {}),
           ...("showMap" in out && out.showMap ? { type: "show_map" as const, ...out.showMap } : {}) });
@@ -127,12 +135,46 @@ export async function runTurn(input: TurnInput): Promise<TurnResult> {
 
   if (!reply) {
     const done = actions.filter((a) => a.ok).map((a) => a.summary);
-    reply = done.length ? `Filed: ${done.join("; ")}.` : "Sorry, I could not finish that. Try again in a moment.";
+    reply = done.length ? `${held.length ? "Ready to send" : "Filed"}: ${done.join("; ")}.` : "Sorry, I could not finish that. Try again in a moment.";
   }
   const now = new Date();
   await d.saveMessage({ userId: ctx.user._id, from: "user", text: said || "(photo)", ts: now });
   await d.saveMessage({ userId: ctx.user._id, from: "agent", text: reply, ts: new Date(+now + 1), eventIds });
-  return { reply, eventIds, actions, model: servedBy };
+  // Held writes are not "done": they leave the chips and wait for the person's yes.
+  const pending = held.length
+    ? { id: stashPending(ctx.user._id, held.map(({ name, input }) => ({ name, input }))), items: held.map((h) => h.summary) }
+    : undefined;
+  return { reply, eventIds, actions: pending ? actions.filter((a) => !held.some((h) => h.summary === a.summary && h.name === a.tool)) : actions,
+    ...(pending ? { pending } : {}), model: servedBy };
+}
+
+/**
+ * The person said yes (send) or no to what a confirm turn held. Sends it through the same tools,
+ * so every check runs again on the desk as it is now. Returns null when nothing is waiting any more.
+ */
+export async function settlePending(userId: string, id: string, send: boolean): Promise<Pick<TurnResult, "eventIds" | "actions"> & { sent: boolean } | null> {
+  const calls = takePending(id, userId);
+  if (!calls) return null;
+  const d = desk();
+  const now = new Date();
+  if (!send) {
+    await d.saveMessage({ userId, from: "user", text: "(did not send it)", ts: now });
+    return { sent: false, eventIds: [], actions: [] };
+  }
+  const ctx = await d.getUserContext(userId);
+  const eventIds: string[] = [];
+  const actions: TurnResult["actions"] = [];
+  for (const c of calls) {
+    const out = await runTool(c.name, c.input, ctx)
+      .catch((e: Error): ToolOutcome => ({ content: `Tool failed: ${e.message}`, isError: true }));
+    if (out.eventId) eventIds.push(out.eventId);
+    actions.push({ tool: c.name, summary: out.summary ?? out.content.slice(0, 120), ok: !out.isError });
+  }
+  const done = actions.filter((a) => a.ok).map((a) => a.summary);
+  await d.saveMessage({ userId, from: "user", text: "Yes, send it.", ts: now });
+  await d.saveMessage({ userId, from: "agent", ts: new Date(+now + 1), eventIds,
+    text: done.length ? `Sent to the desk: ${done.join("; ")}.` : "I could not send that. Please say it again." });
+  return { sent: true, eventIds, actions };
 }
 
 /** Earlier chat lines as plain alternating turns. Must start with a user turn. */

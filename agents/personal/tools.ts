@@ -195,12 +195,19 @@ export function toolsFor(ctx: UserContext): Anthropic.Beta.BetaToolUnion[] {
   return tools;
 }
 
-export interface ToolOutcome { content: string; eventId?: string; isError?: boolean; summary?: string; showMetric?: MetricId; showMap?: { kinds: string[]; ids: string[]; text?: string } }
+export interface ToolOutcome { content: string; eventId?: string; isError?: boolean; summary?: string; pending?: true; showMetric?: MetricId; showMap?: { kinds: string[]; ids: string[]; text?: string } }
 
 // show_map calls per turn: a turn builds one context, so this caps the map at 1 per turn.
 const mapCalls = new WeakMap<UserContext, number>();
 
 class ToolInputError extends Error {}
+
+// Writes held for the person's OK (the /talk screen asks "send this?"). A held tool call runs all its
+// checks, then stops short of posting: it returns `pending` and the caller keeps the call to run later.
+const held = new WeakSet<UserContext>();
+export function holdWrites(ctx: UserContext): void { held.add(ctx); }
+const HELD_NOTE = "Held for the person's yes, which the screen asks for after your reply. " +
+  "Do not mention confirming, sending, filing or being ready. Reply as if it were on the desk: say what you understood and what they do next, in the present tense.";
 
 /** Runs one tool call for one person. Never throws for bad input: returns an error result instead. */
 export async function runTool(name: string, input: Record<string, unknown>, ctx: UserContext): Promise<ToolOutcome> {
@@ -224,6 +231,7 @@ function needId<T>(v: T | undefined, what: string): T {
 }
 
 async function post(ctx: UserContext, type: NewEvent["type"], payload: unknown, summary: string): Promise<ToolOutcome> {
+  if (held.has(ctx)) return { content: `Ready: ${summary}. ${HELD_NOTE}`, summary, pending: true };
   const id = await desk().postEvent({ deskId: ctx.user.deskId, type, source: "person", actor: ctx.user._id, payload,
     observedAt: new Date().toISOString() });
   return { content: `Filed as event ${id}. ${summary}. The desk processes it in a few seconds.`, eventId: id, summary };
@@ -359,6 +367,7 @@ async function run(name: string, i: Record<string, unknown>, ctx: UserContext): 
 
     case "shift_handoff": {
       if (u.role !== "coordinator") throw new ToolInputError("Only a coordinator can write the handoff.");
+      if (held.has(ctx)) return { content: `Ready: the shift handoff note. ${HELD_NOTE}`, summary: "Handoff note", pending: true };
       const note = await writeHandoff(u.deskId, ctx.now);
       if (!note.ok) return { content: note.text, isError: true, summary: "Handoff failed" };
       return { content: note.text, summary: "Handoff written" };

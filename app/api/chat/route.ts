@@ -1,6 +1,9 @@
 // POST /api/chat — one turn with the person's own agent. Owner: Role 2.
-// Body: { text?, imageBase64?, audioBase64?, coords?, speak?, speechSpeed? }
-//   → { reply, eventIds, actions, heard?, replyAudio? }
+// Body: { text?, imageBase64?, audioBase64?, coords?, speak?, speechSpeed?, confirm? }
+//   → { reply, eventIds, actions, heard?, replyAudio?, pending? }
+// confirm: true holds what the agent would file. Nothing reaches the desk yet; `pending` = { id, items }
+//   lists it. Then POST { approve: id, send: true|false } files it (or drops it) → { sent, eventIds, actions }.
+//   Without confirm the agent files at once, as before (the field phone, the API).
 // Who is talking: the login, once SSOJet is in. Until then ?user=<id> (or body.userId),
 // accepted only when DEMO_MODE=1 and the request comes from this laptop (isLocalDemo, #11).
 // Through a tunnel or the network, people must sign in.
@@ -13,7 +16,7 @@
 
 import { after, NextResponse } from "next/server";
 import { refreshChatSummary } from "@/agents/personal/memory";
-import { runTurn, type TurnInput } from "@/agents/personal/turn";
+import { runTurn, settlePending, type TurnInput } from "@/agents/personal/turn";
 import { desk } from "@/agents/desk";
 import { speak, transcribe, voiceEnabled } from "@/agents/shared/voice";
 import { sessionUserId } from "@/auth";
@@ -60,6 +63,9 @@ interface Body {
   coords?: unknown;
   speak?: unknown;
   speechSpeed?: unknown;         // 0.7–1.2, the /talk voice-speed slider
+  confirm?: unknown;             // true: hold the filing until the person says yes
+  approve?: unknown;             // the pending id of an earlier confirm turn
+  send?: unknown;                // with approve: true sends it, anything else drops it
 }
 
 export async function POST(req: Request) {
@@ -78,6 +84,14 @@ export async function POST(req: Request) {
     if (!isLocalDemo(req)) return NextResponse.json({ error: "Sign in. Demo users work only on this laptop." }, { status: 401 });
   }
   if (!(await desk().getUser(userId))) return NextResponse.json({ error: `unknown user ${userId}` }, { status: 404 });
+
+  // The person answered "send this?" for an earlier confirm turn. No model call, so no rate limit.
+  if (body.approve !== undefined) {
+    if (typeof body.approve !== "string") return NextResponse.json({ error: "approve must be a string" }, { status: 400 });
+    const r = await settlePending(userId, body.approve, body.send === true);
+    if (!r) return NextResponse.json({ error: "That is no longer waiting. Say it again." }, { status: 410 });
+    return NextResponse.json(r);
+  }
 
   const ip = (req.headers.get("x-forwarded-for") ?? "local").split(",")[0].trim();
   if (limited(`${ip}|${userId}`)) {
@@ -132,7 +146,7 @@ export async function POST(req: Request) {
     ? (c as [number, number]) : undefined;
 
   try {
-    const result = await runTurn({ userId, text, image, coords });
+    const result = await runTurn({ userId, text, image, coords, confirm: body.confirm === true });
     // After the reply is sent: fold old chat lines into the summary (MongoDB desk only).
     if (desk().name === "mongodb") after(() => refreshChatSummary(userId!));
     // The reply as speech, when asked for. A voice failure never loses the written reply.

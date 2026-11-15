@@ -1,10 +1,10 @@
 "use client";
 // /talk: one person and their own agent, voice first, laid out like a phone voice mode.
 // A big orb sits at the bottom centre: hold it (or the space bar) and talk, it grows and follows
-// your voice; let go and it shrinks back and the note is sent. The conversation flows top to
-// bottom above it. While the agent speaks, its answer plays once like song lyrics: big lines,
-// the one being said lit up and kept in the middle, the rest dimmed. When it ends (or you talk
-// over it) the answer settles into the chat as ordinary text.
+// your voice; let go and the note goes to your agent. The conversation flows top to bottom above it.
+// The agent's answer shows as plain text, whole, and is read out loud at the same time.
+// Nothing reaches the desk yet: the agent only prepares it, and once the answer has been read a
+// card asks "Send this to the desk?". Send files it, Don't send drops it.
 // Pressing while the agent speaks talks over it. Typing still works. Tasks, the person switcher
 // and the voice settings are small panels at the top. Owner: Role 2.
 import { AnimatePresence, motion } from "motion/react";
@@ -32,8 +32,10 @@ interface Turn {
   from: "person" | "agent";
   text: string;
   voice?: boolean;                       // the person spoke it (ElevenLabs heard it)
-  live?: { ms: number; startedAt?: number }; // agent: the one lyrics pass, while it is being said
+  speaking?: boolean;                    // agent: the voice is reading it out right now
   actions?: { tool: string; summary: string; ok: boolean }[];
+  // agent: what the desk would get, waiting for the person's yes
+  pending?: { id: string; items: string[]; state: "ask" | "sending" | "sent" | "dropped" | "error"; error?: string };
 }
 
 const TOOL_WORD: Record<string, string> = {
@@ -61,75 +63,6 @@ function chipText(summary: string): string {
 }
 
 const initialsOf = (name: string) => name.split(/\s+/).map((w) => w[0]).join("").slice(0, 2).toUpperCase();
-/** Without a voice the lyrics still pass once, at a calm reading pace. */
-const readingMs = (text: string) => Math.min(9000, Math.max(1500, text.split(/\s+/).length * 170));
-
-/** The answer as lyric lines: sentences, and long ones cut at a comma, about 25–80 characters each. */
-function lyricLines(text: string): string[] {
-  const out: string[] = [];
-  // Sentence ends only. A colon or a short opener ("Filed:") stays with what follows it.
-  const sentences: string[] = [];
-  // A sentence ends at . ! ? ; before a capital letter, never after an address word ("Çınar St. 3").
-  const END = /(?<!\b(?:St|No|Dr|Mah|Sk|Cad|Cd|Mr|Mrs|Ms|Ave|Blvd|Apt))(?<=[.!?;])\s+(?=["“(]?[A-ZÇĞİÖŞÜ])/u;
-  for (const s of text.trim().split(END)) {
-    if (sentences.length && sentences[sentences.length - 1].length < 20) sentences[sentences.length - 1] += ` ${s}`;
-    else sentences.push(s);
-  }
-  for (const sentence of sentences) {
-    if (sentence.length <= 80) { out.push(sentence); continue; }
-    let line = "";
-    for (const piece of sentence.split(/(?<=,)\s+/)) {
-      if (line && (line + " " + piece).length > 80 && line.length >= 25) { out.push(line); line = piece; }
-      else line = line ? `${line} ${piece}` : piece;
-    }
-    if (line) out.push(line);
-  }
-  return out.filter(Boolean);
-}
-
-/**
- * The agent's answer, played once like Spotify lyrics while it is said: each line gets a share of
- * the speech time by its length, the line being said is bright and kept in the middle of the
- * view, said lines and coming lines are dim. `startedAt` is when the voice started (null: not yet).
- * At the end it calls onDone and the turn shows as plain text.
- */
-function Lyrics({ text, ms, startedAt, onDone }: { text: string; ms: number; startedAt?: number; onDone: () => void }) {
-  const lines = lyricLines(text);
-  const [active, setActive] = useState(startedAt === undefined ? -1 : 0);
-  const refs = useRef<(HTMLSpanElement | null)[]>([]);
-  useEffect(() => {
-    if (startedAt === undefined) return;
-    const weight = lines.map((l) => l.length + 12);          // a short pause between lines
-    const total = weight.reduce((a, b) => a + b, 0);
-    const ends = weight.map((_, i) => (weight.slice(0, i + 1).reduce((a, b) => a + b, 0) / total) * ms);
-    let frame = 0;
-    const tick = () => {
-      const t = performance.now() - startedAt;
-      if (t >= ms) { onDone(); return; }
-      setActive(Math.max(0, ends.findIndex((e) => t < e)));
-      frame = requestAnimationFrame(tick);
-    };
-    frame = requestAnimationFrame(tick);
-    return () => cancelAnimationFrame(frame);
-  }, [startedAt, ms, lines.length]); // eslint-disable-line react-hooks/exhaustive-deps
-  useEffect(() => {
-    refs.current[active]?.scrollIntoView({ block: "center", behavior: "smooth" });
-  }, [active]);
-  return (
-    <span className="flex flex-col gap-3 py-2">
-      {lines.map((l, i) => (
-        <motion.span key={i} ref={(el) => { refs.current[i] = el; }}
-          initial={{ opacity: 0, y: 12 }}
-          animate={{ opacity: i === active ? 1 : i < active ? 0.38 : 0.22, y: 0, scale: i === active ? 1 : 0.97 }}
-          transition={{ type: "spring", stiffness: 320, damping: 34, delay: active < 0 ? i * 0.05 : 0 }}
-          className="block origin-left text-2xl leading-snug font-semibold tracking-tight text-balance sm:text-3xl">
-          {l}
-        </motion.span>
-      ))}
-    </span>
-  );
-}
-
 /** A small panel that drops down from the top bar. */
 function Panel({ open, onClose, title, children, align = "left" }: {
   open: boolean; onClose: () => void; title: string; children: React.ReactNode; align?: "left" | "right";
@@ -179,37 +112,37 @@ export function TalkScreen({ me, people, tasks, quakes, voiceOn }: {
     const el = scroller.current;
     if (el) el.scrollTo({ top: el.scrollHeight, behavior: "smooth" });
   }, []);
-  useEffect(toBottom, [turns.length, state, toBottom]);
+  const lastTurn = turns.at(-1);
+  useEffect(toBottom, [turns.length, state, toBottom, lastTurn?.speaking, lastTurn?.pending?.state]);
   // Aftershocks and the task list come from the server: refresh them every 30 s.
   useEffect(() => { const t = setInterval(() => router.refresh(), 30_000); return () => clearInterval(t); }, [router]);
 
   // The id is taken here, not inside the updater: React may run an updater twice (Strict Mode).
   const add = (t: Omit<Turn, "id">) => { const id = ++seq.current; setTurns((xs) => [...xs, { ...t, id }]); return id; };
-  /** The lyrics pass is over (or was talked over): the answer settles as plain text. */
-  const finishFlow = useCallback((id?: number) =>
-    setTurns((xs) => xs.map((t) => (t.live && (id === undefined || t.id === id) ? { ...t, live: undefined } : t))), []);
-  const startLyrics = (id: number) =>
-    setTurns((xs) => xs.map((t) => (t.id === id && t.live ? { ...t, live: { ...t.live, startedAt: performance.now() } } : t)));
+  /** The voice is done (or was talked over): the "send this?" card may show. */
+  const stopSpeaking = useCallback((id?: number) =>
+    setTurns((xs) => xs.map((t) => (t.speaking && (id === undefined || t.id === id) ? { ...t, speaking: false } : t))), []);
+  const patchTurn = (id: number, f: (t: Turn) => Turn) => setTurns((xs) => xs.map((t) => (t.id === id ? f(t) : t)));
 
   async function send(body: { text?: string; audioBase64?: string }) {
     setState("thinking");
     try {
       const res = await fetch(`/api/chat?user=${encodeURIComponent(me.id)}`, {
         method: "POST", headers: { "content-type": "application/json" },
-        body: JSON.stringify({ ...body, speak: speakReplies && voiceOn, speechSpeed: speed }),
+        body: JSON.stringify({ ...body, speak: speakReplies && voiceOn, speechSpeed: speed, confirm: true }),
       });
       const r = await res.json();
       if (!res.ok) throw new Error(r.error ?? `HTTP ${res.status}`);
       if (body.audioBase64) add({ from: "person", text: r.heard || "(nothing heard)", voice: true });
       let reply: LoadedReply | null = null;
       if (r.replyAudio) reply = await voice.load(r.replyAudio).catch(() => null);
-      const id = add({ from: "agent", text: r.reply, actions: r.actions, live: { ms: reply ? reply.seconds * 1000 : readingMs(r.reply) } });
+      const id = add({ from: "agent", text: r.reply, actions: r.actions, speaking: Boolean(reply),
+        pending: r.pending ? { ...r.pending, state: "ask" } : undefined });
       if (reply) {
         setState("speaking");
-        startLyrics(id);                 // the lines move with the voice from its first syllable
         await reply.play().catch(() => {});
-        finishFlow(id);
-      } else startLyrics(id);
+        stopSpeaking(id);
+      }
     } catch (e) {
       add({ from: "agent", text: `Something went wrong: ${(e as Error).message}. Try again.` });
     } finally {
@@ -221,7 +154,7 @@ export function TalkScreen({ me, people, tasks, quakes, voiceOn }: {
   async function pressStart() {
     const s = stateRef.current;
     if (s === "thinking" || s === "listening" || !voiceOn) return;
-    if (s === "speaking") { voice.stopPlayback(); finishFlow(); }
+    if (s === "speaking") { voice.stopPlayback(); stopSpeaking(); }
     holding.current = true;
     setState("listening");           // the orb grows at once, even while the mic is still opening
     const ok = await voice.start();
@@ -247,10 +180,26 @@ export function TalkScreen({ me, people, tasks, quakes, voiceOn }: {
   async function submit(text: string) {
     const t = text.trim();
     if (!t || stateRef.current === "thinking" || stateRef.current === "listening") return;
-    if (stateRef.current === "speaking") { voice.stopPlayback(); finishFlow(); }
+    if (stateRef.current === "speaking") { voice.stopPlayback(); stopSpeaking(); }
     setTyped("");
     add({ from: "person", text: t });
     await send({ text: t });
+  }
+
+  /** The person's answer to "Send this to the desk?" */
+  async function decide(turnId: number, pendingId: string, send: boolean) {
+    patchTurn(turnId, (t) => (t.pending ? { ...t, pending: { ...t.pending, state: "sending" } } : t));
+    try {
+      const res = await fetch(`/api/chat?user=${encodeURIComponent(me.id)}`, {
+        method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ approve: pendingId, send }),
+      });
+      const r = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(r.error ?? "Could not reach the desk. Tap Send to try again.");
+      patchTurn(turnId, (t) => ({ ...t, actions: r.sent ? r.actions : t.actions,
+        pending: t.pending ? { ...t.pending, state: r.sent ? "sent" : "dropped" } : t.pending }));
+    } catch (e) {
+      patchTurn(turnId, (t) => (t.pending ? { ...t, pending: { ...t.pending, state: "error", error: (e as Error).message } } : t));
+    }
   }
 
   // Space bar: hold to talk, like the orb (not while typing in a field).
@@ -378,19 +327,10 @@ export function TalkScreen({ me, people, tasks, quakes, voiceOn }: {
                     {t.text}
                   </p>
                 ) : (
-                  <AnimatePresence mode="popLayout" initial={false}>
-                    {t.live ? (
-                      <motion.p key="lyrics" exit={{ opacity: 0, transition: { duration: 0.15 } }}>
-                        <Lyrics text={t.text} ms={t.live.ms} startedAt={t.live.startedAt} onDone={() => finishFlow(t.id)} />
-                      </motion.p>
-                    ) : (
-                      <motion.p key="text" layout initial={{ opacity: 0, y: 6 }} animate={{ opacity: 1, y: 0 }}
-                        transition={{ type: "spring", stiffness: 320, damping: 34 }}
-                        className="text-lg leading-relaxed text-pretty sm:text-xl">
-                        {t.text}
-                      </motion.p>
-                    )}
-                  </AnimatePresence>
+                  <p className="text-lg leading-relaxed text-pretty sm:text-xl">{t.text}</p>
+                )}
+                {t.pending && !t.speaking && (
+                  <SendCard pending={t.pending} onSend={() => void decide(t.id, t.pending!.id, true)} onDrop={() => void decide(t.id, t.pending!.id, false)} />
                 )}
                 {t.actions && t.actions.length > 0 && (
                   <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} transition={{ delay: 0.3 }} className="flex flex-wrap gap-1.5">
@@ -459,6 +399,28 @@ export function TalkScreen({ me, people, tasks, quakes, voiceOn }: {
         </div>
       </div>
     </main>
+  );
+}
+
+/** "Send this to the desk?" Shown once the answer has been read. Nothing is sent before the person taps Send. */
+function SendCard({ pending, onSend, onDrop }: { pending: NonNullable<Turn["pending"]>; onSend: () => void; onDrop: () => void }) {
+  const { state } = pending;
+  if (state === "sent") return <p className="flex items-center gap-1.5 text-sm text-muted-foreground"><CircleCheck className="size-4 text-success" />Sent to the desk.</p>;
+  if (state === "dropped") return <p className="flex items-center gap-1.5 text-sm text-muted-foreground"><CircleX className="size-4" />Not sent.</p>;
+  const busy = state === "sending";
+  return (
+    <motion.div initial={{ opacity: 0, y: 6 }} animate={{ opacity: 1, y: 0 }} role="group" aria-label="Send this to the desk?"
+      className="w-full rounded-2xl border bg-card p-3 shadow-xs">
+      <p className="text-sm font-medium">Send this to the desk?</p>
+      <ul className="mt-1.5 space-y-0.5 text-sm text-muted-foreground">
+        {pending.items.map((it, i) => <li key={i}>{it.replaceAll("_", " ")}</li>)}
+      </ul>
+      {state === "error" && <p className="mt-2 text-xs text-destructive">{pending.error}</p>}
+      <div className="mt-3 flex gap-2">
+        <Button className="flex-1 rounded-full" disabled={busy} onClick={onSend}><SendHorizontal />{busy ? "Sending…" : "Send"}</Button>
+        <Button variant="outline" className="flex-1 rounded-full" disabled={busy} onClick={onDrop}>Don&apos;t send</Button>
+      </div>
+    </motion.div>
   );
 }
 
